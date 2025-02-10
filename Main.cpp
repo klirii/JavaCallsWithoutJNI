@@ -88,9 +88,8 @@ void Main() {
 	
 	DEBUG("thread state -> %d", JavaThread::thread_from_jni_environment(env)->get_thread_state());
 	DEBUG("TlsGetValue: %p", TlsGetValue);
-	DEBUG("test!");
-
 	vm->DetachCurrentThread();
+	DEBUG("test!");
 }
 
 BOOL APIENTRY DllMain(HINSTANCE handle, DWORD reason, LPVOID reserved) {

@@ -440,16 +440,14 @@ public:
     }
 
     void reset_to_mark() {
-        if (_thread->has_pending_exception()) {
-            if (_chunk->_next) {
-                _area->set_size_in_bytes(_size_in_bytes);
-                _chunk->next_chop();
-            }
-
-            _area->_chunk = _chunk;
-            _area->_hwm   = _hwm;
-            _area->_max   = _max;
+        if (_chunk->_next) {
+            _area->set_size_in_bytes(_size_in_bytes);
+            _chunk->next_chop();
         }
+
+        _area->_chunk = _chunk;
+        _area->_hwm = _hwm;
+        _area->_max = _max;
     }
 };
 
@@ -485,6 +483,7 @@ public:
     }
 
     Method* operator -> () const { return _value; }
+    Method* operator () () const { return _value; } \
 
     methodHandle& operator=(const methodHandle& s) {
         remove();
@@ -661,9 +660,19 @@ class JavaCalls {
 private:
     typedef void*(__fastcall* call_t)(JavaValue* result, methodHandle* method, JavaCallArguments* args, JavaThread* thread);
 public:
+    //static void call(JavaValue* result, methodHandle method, JavaCallArguments* args, JavaThread* thread) {
+    //    reinterpret_cast<call_t>((BYTE*)jvm + JAVA_CALLS_CALL)(result, &method, args, thread);
+    //}
+
     static void call(JavaValue* result, methodHandle method, JavaCallArguments* args, JavaThread* thread) {
-        reinterpret_cast<call_t>((BYTE*)jvm + JAVA_CALLS_CALL)(result, &method, args, thread);
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(method));
+
+        reinterpret_cast<call_t>((BYTE*)jvm + JAVA_CALLS_CALL)(result, new_method, args, thread);
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
     }
+
 };
 
 class JNIHandles {
