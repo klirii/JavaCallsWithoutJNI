@@ -1,34 +1,25 @@
 #include "Offsets.hpp"
 
-bool* AssumeMP  = nullptr;
-bool* UseMembar = nullptr;
+bool* AssumeMP      = nullptr;
+bool* UseMembar     = nullptr;
+bool* CheckJNICalls = nullptr;
 
 typedef unsigned char  u1;
 typedef unsigned short u2;
 
+class JavaCallArguments;
+class JavaFrameAnchor;
+class JavaValue;
+class methodHandle;
+class JavaThread;
+class HandleMark;
+
+extern void call_helper(JavaValue* result, methodHandle* m, JavaCallArguments* args, JavaThread* thread);
+
+#define JVM_ACC_STATIC 0x0008  /* instance variable is static */
+
 #define NEW_RESOURCE_ARRAY(type, size)\
     (type*)resource_allocate_bytes(size * sizeof(type), AllocFailType::EXIT_OOM);
-
-// NOTE: replicated in SA in vm/agent/sun/jvm/hotspot/runtime/BasicType.java
-enum BasicType {
-    T_BOOLEAN = 4,
-    T_CHAR = 5,
-    T_FLOAT = 6,
-    T_DOUBLE = 7,
-    T_BYTE = 8,
-    T_SHORT = 9,
-    T_INT = 10,
-    T_LONG = 11,
-    T_OBJECT = 12,
-    T_ARRAY = 13,
-    T_VOID = 14,
-    T_ADDRESS = 15,
-    T_NARROWOOP = 16,
-    T_METADATA = 17,
-    T_NARROWKLASS = 18,
-    T_CONFLICT = 19, // for stack value type with conflicting contents
-    T_ILLEGAL = 99
-};
 
 enum JNICallType {
     JNI_STATIC,
@@ -100,50 +91,6 @@ public:
     void set_type(BasicType t) { _type = t; }
 };
 
-class JavaCallArguments {
-public:
-    enum Constants {
-        _default_size = 8    // Must be at least # of arguments in JavaCalls methods
-    };
-
-    intptr_t    _value_buffer[_default_size + 1];
-    u_char      _value_state_buffer[_default_size + 1];
-
-    intptr_t* _value;
-    u_char* _value_state;
-    int         _size;
-    int         _max_size;
-    bool        _start_at_zero;      // Support late setting of receiver
-
-    JavaCallArguments(int max_size) {
-        if (max_size > _default_size) {
-            _value = NEW_RESOURCE_ARRAY(intptr_t, max_size + 1);
-            _value_state = NEW_RESOURCE_ARRAY(u_char, max_size + 1);
-
-            // Reserve room for potential receiver in value and state
-            _value++;
-            _value_state++;
-
-            _max_size = max_size;
-            _size = 0;
-            _start_at_zero = false;
-        }
-        else {
-            initialize();
-        }
-    }
-
-    void initialize() {
-        // Starts at first element to support set_receiver.
-        _value = &_value_buffer[1];
-        _value_state = &_value_state_buffer[1];
-
-        _max_size = _default_size;
-        _size = 0;
-        _start_at_zero = false;
-    }
-};
-
 class ConstantPool {
 public:
     void* vtable;
@@ -204,10 +151,40 @@ public:
     int signature_index() const { return _signature_index; }
 };
 
+class AccessFlags {
+public:
+    jint _flags;
+
+    bool is_static() const { return (_flags & JVM_ACC_STATIC) != 0; }
+};
+
 class Method {
+private:
+    typedef bool(__fastcall* is_empty_method_t)(const Method* instance);
 public:
     void* vtable;
     ConstMethod* _constMethod;
+    void* _method_data;
+    void* _method_counters;
+    AccessFlags _access_flags;
+    int _vtable_index;
+
+    u2 _method_size;
+    u1 _intrinsic_id;
+    u1 _jfr_towrite          : 1,   // Flags
+       _caller_sensitive     : 1,
+       _force_inline         : 1,
+       _hidden               : 1,
+       _running_emcp         : 1,
+       _dont_inline          : 1,
+       _has_injected_profile : 1,
+                             : 2;
+
+    void* _i2i_entry;
+    void* _adapter;
+    void* _from_compiled_entry;
+    void* _code;
+    void* _from_interpreted_entry;
 
     inline static Method* resolve_jmethod_id(jmethodID mid) {
         return *((Method**)mid);
@@ -223,6 +200,16 @@ public:
     Symbol* signature() const { return constants()->symbol_at(signature_index()); }
 
     int size_of_parameters() const { return constMethod()->_size_of_parameters; }
+
+    bool is_empty_method() const {
+        return reinterpret_cast<is_empty_method_t>((BYTE*)jvm + METHOD_IS_EMPTY_METHOD)(this);
+    }
+
+    void* interpreter_entry() const { return _i2i_entry; }
+    void* from_interpreted_entry() const { return _from_interpreted_entry; }
+
+    AccessFlags access_flags() const { return _access_flags; }
+    bool is_static() const { return access_flags().is_static(); }
 };
 
 class SignatureIterator {
@@ -308,6 +295,11 @@ public:
     }
 };
 
+class HandleArea : public Arena {
+public:
+    HandleArea* _prev;
+};
+
 class ResourceArea : public Arena {};
 
 class GenericGrowableArray {
@@ -339,30 +331,19 @@ public:
     void push(const E& elem) { append(elem); }
 };
 
-class HandleMark {
+class JNIHandleBlock {
+private:
+    typedef void(__fastcall* release_block_t)(JNIHandleBlock* block, JavaThread* thread);
 public:
-    JavaThread* _thread;
-    Arena* _area;
-    Chunk* _chunk;
-    char* _hwm, * _max;
-    size_t _size_in_bytes;
-    HandleMark* _previous_handle_mark;
-
-    void pop_and_restore() {
-        if (_chunk->_next) {
-            _area->set_size_in_bytes(_size_in_bytes);
-            _chunk->next_chop();
-        }
-
-        _area->_chunk = _chunk;
-        _area->_hwm = _hwm;
-        _area->_max = _max;
+    static void release_block(JNIHandleBlock* block, JavaThread* thread = nullptr) {
+        reinterpret_cast<release_block_t>((BYTE*)jvm + JNI_HANDLE_BLOCK_RELEASE_BLOCK)(block, thread);
     }
 };
 
 class JavaThread {
 private:
     typedef void(__fastcall* check_safepoint_and_suspend_for_native_trans_t)(JavaThread* thread);
+    typedef bool(__fastcall* reguard_stack_t)(JavaThread* instance);
 public:
     enum SuspendFlags {
         // NOTE: avoid using the sign-bit as cc generates different test code
@@ -373,6 +354,12 @@ public:
 
         _has_async_exception = 0x00000001U, // there is a pending async exception
         _critical_native_unlock = 0x00000002U, // Must call back to unlock JNI critical lock
+    };
+
+    enum StackGuardState {
+        stack_guard_unused,         // not needed
+        stack_guard_yellow_disabled,// disabled (temporarily) after stack overflow
+        stack_guard_enabled         // enabled
     };
 
     static JavaThread* thread_from_jni_environment(JNIEnv* env) {
@@ -408,12 +395,95 @@ public:
         return *(HandleMark**)((BYTE*)this + 72);
     }
 
+    void set_last_handle_mark(HandleMark* mark) {
+        *(HandleMark**)((BYTE*)this + 72) = mark;
+    }
+
     GrowableArray<void*>* metadata_handles() {
         return *(GrowableArray<void*>**)((BYTE*)this + 320);
     }
 
     ResourceArea* resource_area() {
         return *(ResourceArea**)((BYTE*)this + 304);
+    }
+
+    bool is_interp_only_mode() {
+        return (*(int*)((BYTE*)this + 920) != 0);
+    }
+
+    inline bool stack_yellow_zone_disabled() {
+        return (*(StackGuardState*)((BYTE*)this + 668)) == stack_guard_yellow_disabled;
+    }
+
+    bool reguard_stack() {
+        return reinterpret_cast<reguard_stack_t>((BYTE*)jvm + JAVA_THREAD_REGUARD_STACK)(this);
+    }
+
+    JNIHandleBlock* active_handles() { return *(JNIHandleBlock**)((BYTE*)this + 56); }
+    void set_active_handles(JNIHandleBlock* block) { *(JNIHandleBlock**)((BYTE*)this + 56) = block; }
+
+    JavaFrameAnchor* frame_anchor() {
+        return (JavaFrameAnchor*)((BYTE*)this + 472);
+    }
+
+    HandleArea* handle_area() {
+        return *(HandleArea**)((BYTE*)this + 312);
+    }
+
+    void*  vm_result() const { return *(void**)((BYTE*)this + 568); }
+    void set_vm_result(void* x) { *(void**)((BYTE*)this + 568) = x; }
+};
+
+class HandleMark {
+public:
+    JavaThread* _thread;
+    HandleArea* _area;
+    Chunk* _chunk;
+    char* _hwm, * _max;
+    size_t _size_in_bytes;
+    HandleMark* _previous_handle_mark;
+
+    HandleMark(JavaThread* thread) { initialize(thread); }
+
+    ~HandleMark() {
+        HandleArea* area = _area;
+
+        if (_chunk->_next) {
+            _area->set_size_in_bytes(_size_in_bytes);
+            _chunk->next_chop();
+        }
+
+        area->_chunk = _chunk;
+        area->_hwm = _hwm;
+        area->_max = _max;
+
+        _thread->set_last_handle_mark(_previous_handle_mark);
+    }
+
+    void set_previous_handle_mark(HandleMark* mark) { _previous_handle_mark = mark; }
+
+    void initialize(JavaThread* thread) {
+        _thread = thread;
+        _area = thread->handle_area();
+
+        _chunk = _area->_chunk;
+        _hwm = _area->_hwm;
+        _max = _area->_max;
+        _size_in_bytes = _area->_size_in_bytes;
+
+        set_previous_handle_mark(thread->last_handle_mark());
+        thread->set_last_handle_mark(this);
+    }
+
+    void pop_and_restore() {
+        if (_chunk->_next) {
+            _area->set_size_in_bytes(_size_in_bytes);
+            _chunk->next_chop();
+        }
+
+        _area->_chunk = _chunk;
+        _area->_hwm = _hwm;
+        _area->_max = _max;
     }
 };
 
@@ -501,6 +571,96 @@ public:
     }
 };
 
+class Handle {
+public:
+    void* _handle;
+
+    Handle() { _handle = NULL; }
+
+    // Direct interface, use very sparingly.
+    // Used by JavaCalls to quickly convert handles and to create handles static data structures.
+    // Constructor takes a dummy argument to prevent unintentional type conversion in C++.
+    Handle(void* handle, bool dummy) { _handle = handle; }
+};
+
+class JavaCallArguments {
+private:
+    typedef void* (__fastcall* verify_t)(JavaCallArguments* instance, methodHandle* method, BasicType return_type, JavaThread* thread);
+    typedef intptr_t* (__fastcall* parameters_t)(JavaCallArguments* instance);
+public:
+    enum Constants {
+        _default_size = 8    // Must be at least # of arguments in JavaCalls methods
+    };
+
+    // The possible values for _value_state elements.
+    enum {
+        value_state_primitive,
+        value_state_oop,
+        value_state_handle,
+        value_state_jobject,
+        value_state_limit
+    };
+
+#pragma warning(suppress:26495)
+    intptr_t    _value_buffer[_default_size + 1] = { NULL };
+#pragma warning(suppress:26495)
+    u_char      _value_state_buffer[_default_size + 1] = { NULL };
+
+    intptr_t* _value;
+    u_char* _value_state;
+    int         _size;
+    int         _max_size;
+    bool        _start_at_zero;      // Support late setting of receiver
+
+    JavaCallArguments(int max_size) {
+        if (max_size > _default_size) {
+            _value = NEW_RESOURCE_ARRAY(intptr_t, max_size + 1);
+            _value_state = NEW_RESOURCE_ARRAY(u_char, max_size + 1);
+
+            // Reserve room for potential receiver in value and state
+            _value++;
+            _value_state++;
+
+            _max_size = max_size;
+            _size = 0;
+            _start_at_zero = false;
+        }
+        else {
+            initialize();
+        }
+    }
+
+    void initialize() {
+        // Starts at first element to support set_receiver.
+        _value = &_value_buffer[1];
+        _value_state = &_value_state_buffer[1];
+
+        _max_size = _default_size;
+        _size = 0;
+        _start_at_zero = false;
+    }
+
+    void verify(methodHandle method, BasicType return_type, JavaThread* thread) {
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(method));
+
+        reinterpret_cast<verify_t>((BYTE*)jvm + JAVA_CALL_ARGUMENTS_VERIFY)(this, new_method, return_type, thread);
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+    }
+
+    // receiver
+    Handle receiver() {
+        return Handle((void*)_value[0], false);
+    }
+
+    intptr_t* parameters() {
+        return reinterpret_cast<parameters_t>((BYTE*)jvm + JAVA_CALL_ARGUMENTS_PARAMETERS)(this);
+    }
+
+    int size_of_parameters() const { return _size; }
+};
+
 class Fingerprinter : public SignatureIterator {
 private:
     typedef uint64_t(__fastcall* fingerprint_t)(Fingerprinter* instance);
@@ -522,6 +682,9 @@ public:
 };
 
 class os {
+private:
+    typedef bool(__fastcall* stack_shadow_pages_available_t)(JavaThread* thread, methodHandle* method);
+    typedef void*(__fastcall* bang_stack_shadow_pages_t)(void);
 public:
     static int processor_count() {
         return *(int*)((BYTE*)jvm + OS_PROCESSOR_COUNT);
@@ -529,6 +692,22 @@ public:
 
     static inline bool is_MP() {
         return (processor_count() != 1) || *AssumeMP;
+    }
+
+    static bool stack_shadow_pages_available(JavaThread* thread, methodHandle method) {
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(method));
+
+        bool result = reinterpret_cast<stack_shadow_pages_available_t>((BYTE*)jvm + OS_STACK_SHADOW_PAGES_AVAILABLE)(
+            thread, new_method
+        );
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+        return result;
+    }
+
+    static void bang_stack_shadow_pages() {
+        reinterpret_cast<bang_stack_shadow_pages_t>((BYTE*)jvm + OS_BANG_STACK_SHADOW_PAGES)();
     }
 };
 
@@ -603,6 +782,13 @@ public:
 
         thread->set_thread_state(to);
     }
+
+    // Same as above, but assumes from = _thread_in_Java. This is simpler, since we
+    // never block on entry to the VM. This will break the code, since e.g. preserve arguments
+    // have not been setup.
+    static inline void transition_from_java(JavaThread* thread, JavaThreadState to) {
+        thread->set_thread_state(to);
+    }
 };
 
 class WeakPreserveExceptionMark {
@@ -665,14 +851,14 @@ public:
     //}
 
     static void call(JavaValue* result, methodHandle method, JavaCallArguments* args, JavaThread* thread) {
-        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
-        new (new_method) methodHandle(std::move(method));
+        //auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        //new (new_method) methodHandle(std::move(method));
 
-        reinterpret_cast<call_t>((BYTE*)jvm + JAVA_CALLS_CALL)(result, new_method, args, thread);
+        //reinterpret_cast<call_t>((BYTE*)jvm + JAVA_CALLS_CALL)(result, new_method, args, thread);
+        call_helper(result, &method, args, thread);
 
-        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+        //operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
     }
-
 };
 
 class JNIHandles {
@@ -682,4 +868,167 @@ public:
     static inline jobject make_local(JNIEnv* env, void* obj) {
         return reinterpret_cast<make_local_t>((BYTE*)jvm + JNI_HANDLES_MAKE_LOCAL)(env, obj);
     }
+};
+
+class CompilationPolicy {
+private:
+    typedef bool(__fastcall* must_be_compiled_t)(methodHandle* m);
+    typedef int(__fastcall* initial_compile_level_t)(CompilationPolicy* instance);
+public:
+    void* vftable;
+
+    static bool must_be_compiled(methodHandle m) {
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(m));
+
+        bool result = reinterpret_cast<must_be_compiled_t>((BYTE*)jvm + COMPILATION_POLICY_MUST_BE_COMPILED)(new_method);
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+
+        return result;
+    }
+
+
+    static CompilationPolicy* policy() { 
+        return *reinterpret_cast<CompilationPolicy**>((BYTE*)jvm + COMPILATION_POLICY_POLICY);
+    }
+
+    int initial_compile_level() {
+        return (*reinterpret_cast<initial_compile_level_t*>(this->vftable))(this);
+    }
+};
+
+class CompileBroker {
+    typedef void* (__fastcall* compile_method_t)(
+        methodHandle* method,
+        int osr_bci,
+        int comp_level,
+        methodHandle* hot_method,
+        int hot_count,
+        const char* comment,
+        JavaThread* thread
+    );
+public:
+    static void* compile_method(
+        methodHandle method,
+        int osr_bci,
+        int comp_level,
+        methodHandle hot_method,
+        int hot_count,
+        const char* comment,
+        JavaThread* thread
+    ) {
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(method));
+
+        auto* new_hot_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_hot_method) methodHandle(std::move(hot_method));
+
+        void* result = reinterpret_cast<compile_method_t>((BYTE*)jvm + COMPILE_BROKER_COMPILE_METHOD)(
+            new_method,
+            osr_bci,
+            comp_level,
+            new_hot_method,
+            hot_count,
+            comment,
+            thread
+            );
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+        operator delete(new_hot_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+
+        return result;
+    }
+};
+
+class JvmtiExport {
+public:
+    inline static bool can_post_interpreter_events() {
+        return *(bool*)((BYTE*)jvm + JVMTI_EXPORT_CAN_POST_INTERPRETER_EVENTS);
+    }
+};
+
+class Exceptions {
+private:
+    typedef void* (__fastcall* throw_stack_overflow_exception_t)(JavaThread* thread, const char* file, int line, methodHandle* method);
+public:
+    static void throw_stack_overflow_exception(JavaThread* thread, const char* file, int line, methodHandle method) {
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(method));
+
+        reinterpret_cast<throw_stack_overflow_exception_t>((BYTE*)jvm + EXCEPTIONS_THROW_STACK_OVERFLOW_EXCEPTION)(
+            thread, file, line, new_method
+        );
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+    }
+};
+
+class JavaFrameAnchor {
+public:
+    intptr_t* volatile _last_Java_sp;
+    volatile void* _last_Java_pc;
+    intptr_t* volatile _last_Java_fp;
+
+    void zap(void) { _last_Java_sp = NULL; }
+
+    void copy(JavaFrameAnchor* src) {
+        if (_last_Java_sp != src->_last_Java_sp)
+            _last_Java_sp = NULL;
+
+        _last_Java_fp = src->_last_Java_fp;
+        _last_Java_pc = src->_last_Java_pc;
+        _last_Java_sp = src->_last_Java_sp;
+    }
+};
+
+class JavaCallWrapper {
+private:
+    typedef JavaCallWrapper* (__fastcall* JavaCallWrapper_ctor_t)(JavaCallWrapper* instance, methodHandle* callee_method, Handle receiver, JavaValue* result, JavaThread* thread);
+public:
+    JavaThread* _thread = nullptr;
+    JNIHandleBlock* _handles = nullptr;
+    Method* _callee_method = nullptr;
+    void* _receiver = nullptr;
+    JavaFrameAnchor _anchor = { NULL };
+    JavaValue* result = nullptr;
+
+    JavaCallWrapper(methodHandle callee_method, Handle receiver, JavaValue* result, JavaThread* thread) {
+        auto* new_method = static_cast<methodHandle*>(operator new(sizeof(methodHandle)));
+        new (new_method) methodHandle(std::move(callee_method));
+
+        reinterpret_cast<JavaCallWrapper_ctor_t>((BYTE*)jvm + JAVA_CALL_WRAPPER_CONSTRUCTOR)(
+            this, new_method, receiver, result, thread
+        );
+
+        operator delete(new_method, sizeof(methodHandle)); // Деструктор НЕ вызывается
+    }
+
+    ~JavaCallWrapper() {
+        JNIHandleBlock* _old_handles = _thread->active_handles();
+        _thread->set_active_handles(_handles);
+
+        _thread->frame_anchor()->zap();
+        ThreadStateTransition::transition_from_java(_thread, _thread_in_vm);
+
+        _thread->frame_anchor()->copy(&_anchor);
+        JNIHandleBlock::release_block(_old_handles, _thread);
+    }
+};
+
+class StubRoutines {
+public:
+    // Calls to Java
+    typedef void (*CallStub)(
+        void*       link,
+        intptr_t*   result,
+        BasicType   result_type,
+        Method*     method,
+        void*       entry_point,
+        intptr_t*   parameters,
+        int         size_of_parameters,
+        JavaThread* thread
+    );
+
+    static CallStub call_stub() { return *reinterpret_cast<CallStub*>((BYTE*)jvm + STUB_ROUTINES_CALL_STUB_ENTRY); }
 };
