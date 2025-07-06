@@ -42,8 +42,4 @@ These offsets are used to interact directly with the JVM's internal structures a
 
 Due to the complexity and size of full JVM classes, not all of them were fully replicated. To access certain fields inside these classes, additional offsets (relative to the start of class) were identified. These are also **guaranteed to be valid only for the official JVM 8u191 b12**.
 
-For other JVM builds or vendors, internal layouts may differ – so offsets and structure definitions may need to be adjusted. You can find the relevant values in `JvmStructures.hpp`.
-
----
-
-Feel free to open issues or PRs if you're adapting this for other JVM versions or Java games.
+For other JVM builds or vendors, internal layouts may differ – so offsets and structure definitions may need to be adjusted. You can find the relevant values in `Offsets.hpp` and `JvmStructures.hpp`.
